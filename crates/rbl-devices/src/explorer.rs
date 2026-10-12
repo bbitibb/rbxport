@@ -68,29 +68,133 @@ pub fn roots() -> Vec<Entry> {
     if let Some(home) = dirs::home_dir().filter(|p| p.is_dir()) {
         out.push(Entry { name: last_component(&home), path: home });
     }
-    // One refresh for both the system volume's name and the other volumes:
-    // each refresh is a `statfs` of every mount, which waits on a sleeping
-    // card reader.
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    if let Some(system) = system_volume(&disks) {
-        out.push(system);
-    }
     let volumes = if std::env::var_os(crate::FAKE_VOLUMES).is_some() {
-        crate::list()
+        fake_volume_roots()
     } else {
-        crate::devices_from(&disks)
+        platform_volume_roots()
     };
-    for device in volumes {
-        if is_hidden_name(&device.name) {
+    for volume in volumes {
+        if is_hidden_name(&volume.name) {
             continue;
         }
-        out.push(Entry { name: device.name, path: device.mount_point });
+        out.push(volume);
     }
     // The same volume can be reached two ways — a fake volume set to the
     // home folder, say — and one row is enough.
     let mut seen = std::collections::HashSet::new();
     out.retain(|entry| seen.insert(entry.path.clone()));
     out
+}
+
+fn fake_volume_roots() -> Vec<Entry> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut out = system_volume(&disks).into_iter().collect::<Vec<_>>();
+    out.extend(crate::list().into_iter().map(|device| Entry {
+        name: device.name,
+        path: device.mount_point,
+    }));
+    out
+}
+
+#[cfg(not(windows))]
+fn platform_volume_roots() -> Vec<Entry> {
+    // One refresh for both the system volume's name and the other volumes:
+    // each refresh is a `statfs` of every mount, which waits on a sleeping
+    // card reader.
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut out = system_volume(&disks).into_iter().collect::<Vec<_>>();
+    out.extend(crate::devices_from(&disks).into_iter().map(|device| Entry {
+        name: device.name,
+        path: device.mount_point,
+    }));
+    out
+}
+
+/// Every assigned Windows drive letter, including mapped network shares.
+///
+/// `sysinfo` deliberately keeps only fixed and removable drives on Windows,
+/// which is right for export destinations but leaves network music out of the
+/// Explorer. The Windows logical-drive mask includes all three kinds without
+/// turning a network share into a device the app can export to.
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "Windows drive enumeration and volume labels require Win32 FFI"
+)]
+fn platform_volume_roots() -> Vec<Entry> {
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    // SAFETY: GetLogicalDrives takes no pointers or caller-owned resources.
+    let mask = unsafe { GetLogicalDrives() };
+    let mut roots = drive_roots(mask);
+    if let Some(system) = windows_system_root() {
+        if let Some(position) = roots.iter().position(|path| path == &system) {
+            let system = roots.remove(position);
+            roots.insert(0, system);
+        }
+    }
+    roots
+        .into_iter()
+        .map(|path| Entry {
+            name: windows_root_name(&path, windows_volume_label(&path).as_deref()),
+            path,
+        })
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+fn drive_roots(mask: u32) -> Vec<PathBuf> {
+    (0_u8..26)
+        .filter(|index| mask & (1_u32 << u32::from(*index)) != 0)
+        .map(|index| PathBuf::from(format!("{}:\\", char::from(b'A' + index))))
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_system_root() -> Option<PathBuf> {
+    let drive = std::env::var_os("SystemDrive")?;
+    Some(PathBuf::from(format!("{}\\", drive.to_string_lossy())))
+}
+
+#[cfg(any(windows, test))]
+fn windows_root_name(path: &Path, label: Option<&str>) -> String {
+    let text = path.to_string_lossy();
+    let drive = text.trim_end_matches(['\\', '/']);
+    label
+        .filter(|label| !label.is_empty())
+        .map_or_else(|| drive.to_owned(), |label| format!("{label} ({drive})"))
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "Reading a Windows volume label requires Win32 FFI"
+)]
+fn windows_volume_label(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+
+    let root = path.as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let mut label = [0_u16; 261];
+    // SAFETY: `root` is NUL-terminated, `label` is writable for its reported
+    // length, and every unused optional output pointer is null.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            label.as_mut_ptr(),
+            u32::try_from(label.len()).unwrap_or(u32::MAX),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let end = label.iter().position(|unit| *unit == 0).unwrap_or(label.len());
+    Some(String::from_utf16_lossy(&label[..end]))
 }
 
 /// The volume the OS boots from, named the way the OS names it.
@@ -227,6 +331,22 @@ mod tests {
 
     fn names(listing: &Listing) -> Vec<&str> {
         listing.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_windows_drive_mask_becomes_each_assigned_root() {
+        let mask = (1 << 2) | (1 << 3) | (1 << 12) | (1 << 21);
+        assert_eq!(
+            drive_roots(mask),
+            ["C:\\", "D:\\", "M:\\", "V:\\"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_windows_root_name_keeps_its_drive_letter() {
+        assert_eq!(windows_root_name(Path::new("D:\\"), Some("Data")), "Data (D:)");
+        assert_eq!(windows_root_name(Path::new("M:\\"), Some("")), "M:");
+        assert_eq!(windows_root_name(Path::new("V:\\"), None), "V:");
     }
 
     #[test]
